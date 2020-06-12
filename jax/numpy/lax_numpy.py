@@ -1078,6 +1078,7 @@ def reshape(a, newshape, order="C"):
 def _compute_newshape(a, newshape):
   """Fixes a -1 value in newshape, if present."""
   # other errors, like having more than one -1, are caught downstream
+  newshape = list(map(int, newshape))
   newsize = _prod(newshape)
   if newsize < 0:
     fix = a.size // -newsize

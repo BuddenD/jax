@@ -18,6 +18,8 @@ import contextlib
 from typing import (Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple,
                     List, Union, cast)
 from weakref import ref
+import inspect
+import os
 
 import numpy as onp
 
@@ -733,15 +735,41 @@ def _move_to_front(lst: Sequence, to_move: Sequence[bool]) -> Sequence:
 
 
 class JaxprTracer2(core.Tracer):
-  __slots__ = ['aval']
+  __slots__ = ['aval', 'line_info']
 
-  def __init__(self, trace, aval):
+  def __init__(self, trace, aval, line_info=None):
     self._trace = trace
     self.aval = aval
+    self.line_info = line_info
 
   def full_lower(self):
     return self
 
+  def __bool__(self):
+    self._concretization_error('__bool__')
+
+  def __int__(self):
+    self._concretization_error('__int__')
+
+  def _concretization_error(self, name):
+    msg = self._progenitor_messages()
+    msg = (f"Abstract tracer value passed to {name} for which a concrete value "
+           "is required.\n"
+           "This tracer originated from using JAX operations on these lines:\n"
+           + "\n".join(msgs) + "\n"
+           "See the above traceback for where this tracer was encountered.")
+    raise core.ConcretizationTypeError(msg)
+
+  def _progenitor_messages(self):
+    progenitor_eqns = self._trace.frame.find_progenitors(self)
+    frame_infos = [eqn.source_info and user_source_info(eqn.source_info)
+                   for eqn in progenitor_eqns]
+    source_infos = [f"{f.filename}:{f.lineno}" if f else "[unknown]"
+                    for f in frame_infos]
+    msgs = [f"  operation {core.pp_eqn(eqn, print_shapes=True)}\n"
+            f"    from line {source_info}"
+            for eqn, source_info in zip(progenitor_eqns, source_infos)]
+    return msgs
 
 class JaxprStackFrame:
   __slots__ = ['newvar', 'tracer_to_var', 'constid_to_var', 'constvar_to_val',
@@ -765,6 +793,15 @@ class JaxprStackFrame:
     out_avals = [t.aval for t in out_tracers]
     return jaxpr, out_avals, constvals
 
+  def find_progenitors(self, tracer):
+    active_vars = {self.tracer_to_var[id(tracer)]}
+    for eqn in self.eqns[::-1]:
+      produced = set(eqn.outvars) & active_vars
+      if produced:
+        active_vars.difference_update(produced)
+        active_vars.update(eqn.invars)
+    return [eqn for eqn in self.eqns if set(eqn.invars) & active_vars]
+
 def _inline_literals(jaxpr, constvals):
   consts = dict(zip(jaxpr.constvars, constvals))
   newvar = core.gensym()
@@ -787,7 +824,7 @@ def _inline_literals(jaxpr, constvals):
   new_invars = [var[v] for v in jaxpr.invars]
   new_eqns = [new_jaxpr_eqn([lit(v) or var[v] for v in eqn.invars],
                             [var[v] if v in used else dropvar for v in eqn.outvars],
-                            eqn.primitive, eqn.params)
+                            eqn.primitive, eqn.params, eqn.source_info)
               for eqn in jaxpr.eqns]
   new_outvars = [lit(v) or var[v] for v in jaxpr.outvars]
   new_jaxpr = Jaxpr(new_constvars, new_invars, new_outvars, new_eqns)
@@ -841,7 +878,7 @@ class JaxprTrace2(core.Trace):
     out_tracers = [JaxprTracer2(self, a) for a in out_avals]
     invars = map(self.getvar, tracers)
     outvars = map(self.getvar, out_tracers)
-    eqn = new_jaxpr_eqn(invars, outvars, primitive, params)
+    eqn = new_jaxpr_eqn(invars, outvars, primitive, params, source_info())
     self.frame.eqns.append(eqn)
     return out_tracers if primitive.multiple_results else out_tracers.pop()
 
@@ -854,7 +891,8 @@ class JaxprTrace2(core.Trace):
     constvars = map(self.getvar, map(self.instantiate_const, consts))
     update_params = call_param_updaters.get(call_primitive, dict)
     new_params = update_params(params, call_jaxpr=convert_constvars_jaxpr(jaxpr))
-    eqn = new_jaxpr_eqn([*constvars, *invars], outvars, call_primitive, new_params)
+    eqn = new_jaxpr_eqn([*constvars, *invars], outvars, call_primitive, new_params,
+                        source_info())
     self.frame.eqns.append(eqn)
     return out_tracers
 
@@ -878,7 +916,8 @@ class JaxprTrace2(core.Trace):
     update_params = call_param_updaters.get(map_primitive, dict)
     new_params = update_params(dict(params, mapped_invars=new_mapped_invars),
                                call_jaxpr=convert_constvars_jaxpr(jaxpr))
-    eqn = new_jaxpr_eqn([*constvars, *invars], outvars, map_primitive, new_params)
+    eqn = new_jaxpr_eqn([*constvars, *invars], outvars, map_primitive, new_params,
+                        source_info())
     self.frame.eqns.append(eqn)
     return out_tracers
 
@@ -919,3 +958,16 @@ def trace_to_jaxpr_final(fun: lu.WrappedFun, in_avals: Sequence[AbstractValue]):
     jaxpr, out_avals, consts = trace_to_subjaxpr_dynamic(fun, master, in_avals)
     del master
   return jaxpr, out_avals, consts
+
+
+class FrameInfo(NamedTuple):
+  filename: str
+  lineno: int
+
+def source_info():
+  return [FrameInfo(f.filename, f.lineno) for f in inspect.stack()]
+
+def user_source_info(frame_infos):
+  base = os.sep.join(__file__.split(os.sep)[:-2])
+  return next((f for f in frame_infos if base not in f.filename), None)
+

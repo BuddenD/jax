@@ -114,6 +114,12 @@ class TypedJaxpr:
                out_avals: Sequence['AbstractValue']):
     assert len(literals) == len(jaxpr.constvars)
     assert len(in_avals) == len(jaxpr.invars)
+
+    # TODO TODO remove this
+    for l in literals:
+      try: print(l._progenitor_messages())
+      except: pass
+
     assert not any(isinstance(l, Tracer) for l in literals), literals
 
     if not skip_checks:
@@ -147,10 +153,12 @@ class JaxprEqn(NamedTuple):
   outvars: List['Var']
   primitive: 'Primitive'
   params: Dict[str, Any]
+  source_info: Optional[Any]
 
   def __repr__(self): return str(pp_eqn(self)).rstrip()
 
-new_jaxpr_eqn = JaxprEqn
+def new_jaxpr_eqn(invars, outvars, primitive, params, source_info=None):
+  return JaxprEqn(invars, outvars, primitive, params, source_info)
 
 
 @total_ordering
@@ -1391,8 +1399,11 @@ def check_map(prim, in_avals, params):
 
 # ------------------- Jaxpr printed representation -------------------
 
-def pp_vars(vs: Sequence[Any]) -> str:
-  return ' '.join(map(str, vs))
+def pp_vars(vs: Sequence[Any], print_shapes: bool = False) -> str:
+  if print_shapes:
+    return ' '.join(f'{v}:{v.aval.str_short()}' for v in vs)
+  else:
+    return ' '.join(map(str, vs))
 
 def pp_eqn_compact(primitive_name: str, params: Dict) -> PrettyPrint:
   filtered_params = {k: v for k, v in params.items()
@@ -1400,12 +1411,11 @@ def pp_eqn_compact(primitive_name: str, params: Dict) -> PrettyPrint:
                          not isinstance(v, (Jaxpr, TypedJaxpr)))}
   return pp(primitive_name) >> pp_kv_pairs(sorted(filtered_params.items()))
 
-def pp_eqn(eqn: JaxprEqn) -> PrettyPrint:
-  lhs = pp_vars(eqn.outvars)
-  pp_subexpr = pp('')
+def pp_eqn(eqn: JaxprEqn, print_shapes: bool = False) -> PrettyPrint:
+  lhs = pp_vars(eqn.outvars, print_shapes)
   return (pp('{} = '.format(lhs)) >>
           pp(eqn.primitive.name) >> pp_kv_pairs(sorted(eqn.params.items()))
-          >> pp(' ') >> pp(pp_vars(eqn.invars))) + pp_subexpr
+          >> pp(' ') >> pp(pp_vars(eqn.invars, print_shapes)))
 
 def pp_jaxpr(jaxpr: Jaxpr) -> PrettyPrint:
   pp_outvars = str(tuple(jaxpr.outvars))
